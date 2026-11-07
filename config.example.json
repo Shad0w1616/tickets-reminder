@@ -1,0 +1,9 @@
+{
+  "bot_token": "",
+  "chat_id": "",
+  "channel": "hclokomotiv_official",
+  "poll_seconds": 60,
+  "initial_history_days": 30,
+  "remind_minutes": [1440, 60, 10, 0],
+  "watch_until": "2027-01-07T00:00:00+03:00"
+}
