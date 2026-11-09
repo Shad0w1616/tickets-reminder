@@ -2,7 +2,7 @@ import unittest
 from datetime import datetime, timedelta
 from unittest.mock import Mock
 
-from loko_alert import MSK, database, fetch_posts, parse_posts, process, sale_time, send_due
+from loko_alert import BotError, Broadcast, MSK, database, parse_posts, process, sale_time, send_due
 
 
 class AlertTests(unittest.TestCase):
@@ -104,6 +104,62 @@ class AlertTests(unittest.TestCase):
         process(self.db, [self.post("Тренировка")], self.bot, self.config, self.now)
         process(self.db, [self.post("Тренировка завершена")], self.bot, self.config, self.now)
         self.bot.send.assert_not_called()
+
+
+class SubscriptionTests(unittest.TestCase):
+    def setUp(self):
+        self.db = database(":memory:")
+        self.api = Mock(chat_id="10")
+        self.broadcast = Broadcast(self.db, self.api)
+        self.addCleanup(self.db.close)
+
+    @staticmethod
+    def update(n, chat_id, text, kind="private"):
+        return {"update_id": n, "message": {"chat": {"id": chat_id, "type": kind}, "text": text}}
+
+    def test_broadcast_to_two_private_subscribers(self):
+        self.api.call.return_value = [self.update(5, 20, "/start invite"),
+                                      self.update(6, 30, "/start", "group"),
+                                      self.update(7, 20, "/start")]
+        self.broadcast.poll()
+        self.broadcast.send("Ticket sale")
+        self.db.commit()
+        self.broadcast.flush()
+        deliveries = [c.kwargs["chat_id"] for c in self.api.send.call_args_list if c.args[0] == "Ticket sale"]
+        self.assertCountEqual(deliveries, [10, 20])
+        self.api.call.return_value = []
+        Broadcast(self.db, self.api).poll()
+        self.assertEqual(self.api.call.call_args.kwargs["offset"], 8)
+
+    def test_stop_clears_queue_and_does_not_reseed_owner(self):
+        self.broadcast.send("Pending sale")
+        self.api.call.return_value = [self.update(2, 10, "/stop")]
+        self.broadcast.poll()
+        Broadcast(self.db, self.api).send("Next sale")
+        self.broadcast.flush()
+        self.assertEqual(self.api.send.call_count, 1)
+        self.assertIn("/start", self.api.send.call_args.args[0])
+        self.assertEqual(self.db.execute("SELECT count(*) FROM subscribers").fetchone()[0], 0)
+
+    def test_blocked_recipient_does_not_interrupt_broadcast(self):
+        self.db.execute("INSERT INTO subscribers VALUES (20)")
+        self.broadcast.send("Ticket sale")
+        self.db.commit()
+        self.api.send.side_effect = [BotError(403), None]
+        self.broadcast.flush()
+        self.assertEqual(self.api.send.call_count, 2)
+        self.assertEqual(self.db.execute("SELECT chat_id FROM subscribers").fetchall(), [(20,)])
+        self.assertEqual(self.db.execute("SELECT count(*) FROM outbox").fetchone()[0], 0)
+
+    def test_delivery_retry_does_not_resend_successful_copy(self):
+        self.db.execute("INSERT INTO subscribers VALUES (20)")
+        self.broadcast.send("Ticket sale")
+        self.db.commit()
+        self.api.send.side_effect = [None, RuntimeError("offline"), None]
+        with self.assertRaises(RuntimeError):
+            self.broadcast.flush()
+        Broadcast(self.db, self.api).flush()
+        self.assertEqual([c.kwargs["chat_id"] for c in self.api.send.call_args_list], [10, 20, 20])
 
 
 if __name__ == "__main__":

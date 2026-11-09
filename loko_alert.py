@@ -121,6 +121,12 @@ def fetch_posts(session, channel, cutoff, last_id):
     raise RuntimeError("История превышает 100 страниц. Уменьшите initial_history_days")
 
 
+class BotError(RuntimeError):
+    def __init__(self, code, retry_after=0):
+        self.code, self.retry_after = code, retry_after
+        super().__init__(f"Telegram API: код {code}; retry_after={retry_after}")
+
+
 class Bot:
     def __init__(self, session, token, chat_id):
         self.session, self.token, self.chat_id = session, token, chat_id
@@ -135,12 +141,12 @@ class Bot:
             raise RuntimeError("Telegram API: ошибка соединения или неверный ответ") from None
         if not data.get("ok"):
             code = data.get("error_code", response.status_code)
-            retry = data.get("parameters", {}).get("retry_after", "")
-            raise RuntimeError(f"Telegram API: код {code}; retry_after={retry}")
+            retry = data.get("parameters", {}).get("retry_after", 0)
+            raise BotError(code, retry)
         return data["result"]
 
-    def send(self, text):
-        self.call("sendMessage", chat_id=self.chat_id, text=text,
+    def send(self, text, chat_id=None):
+        self.call("sendMessage", chat_id=self.chat_id if chat_id is None else chat_id, text=text,
                   link_preview_options={"is_disabled": True})
 
 
@@ -151,8 +157,87 @@ def database(path):
         CREATE TABLE IF NOT EXISTS reminders (
             post_id INTEGER, minutes INTEGER, due REAL, sale REAL, url TEXT, done INTEGER DEFAULT 0,
             PRIMARY KEY(post_id, minutes));
+        CREATE TABLE IF NOT EXISTS subscribers (chat_id INTEGER PRIMARY KEY);
+        CREATE TABLE IF NOT EXISTS bot_state (key TEXT PRIMARY KEY, value INTEGER NOT NULL);
+        CREATE TABLE IF NOT EXISTS outbox (
+            id INTEGER PRIMARY KEY, chat_id INTEGER NOT NULL, body TEXT NOT NULL,
+            next_try REAL NOT NULL DEFAULT 0, post_id INTEGER, reminder INTEGER NOT NULL DEFAULT 0);
     """)
     return db
+
+
+class Broadcast:
+    def __init__(self, db, bot):
+        self.db, self.bot = db, bot
+        with db:
+            seed = db.execute("INSERT OR IGNORE INTO bot_state VALUES ('seeded', 1)")
+            if seed.rowcount and bot.chat_id:
+                db.execute("INSERT OR IGNORE INTO subscribers VALUES (?)", (int(bot.chat_id),))
+
+    def unsubscribe(self, chat_id):
+        self.db.execute("DELETE FROM subscribers WHERE chat_id=?", (chat_id,))
+        self.db.execute("DELETE FROM outbox WHERE chat_id=?", (chat_id,))
+
+    def poll(self):
+        row = self.db.execute("SELECT value FROM bot_state WHERE key='offset'").fetchone()
+        offset = row[0] if row else 0
+        updates = self.bot.call("getUpdates", offset=offset, timeout=0, limit=100,
+                                allowed_updates=["message"])
+        with self.db:
+            for update in sorted(updates, key=lambda u: u["update_id"]):
+                offset = update["update_id"] + 1
+                message = update.get("message", {})
+                chat = message.get("chat", {})
+                if chat.get("type") != "private":
+                    continue
+                parts = message.get("text", "").split()
+                command = parts[0] if parts else ""
+                chat_id = chat["id"]
+                if command == "/start":
+                    self.db.execute("INSERT OR IGNORE INTO subscribers VALUES (?)", (chat_id,))
+                    reply = "Подписка включена. Буду присылать объявления о билетах и напоминания. Отписаться: /stop."
+                elif command == "/stop":
+                    self.unsubscribe(chat_id)
+                    reply = "Подписка отключена. Включить снова: /start."
+                else:
+                    continue
+                self.db.execute("INSERT INTO outbox (chat_id, body) VALUES (?,?)", (chat_id, reply))
+            if updates:
+                self.db.execute("INSERT OR REPLACE INTO bot_state VALUES ('offset', ?)", (offset,))
+            else:
+                self.db.execute("DELETE FROM bot_state WHERE key='offset'")
+
+    def send(self, text, *, post_id=None, reminder=False):
+        # Caller commits the outbox together with the processed post or reminder.
+        self.db.execute("INSERT INTO outbox (chat_id, body, post_id, reminder) "
+                        "SELECT chat_id, ?, ?, ? FROM subscribers", (text, post_id, reminder))
+
+    def flush(self):
+        rows = self.db.execute("SELECT id, chat_id, body FROM outbox WHERE next_try<=? "
+                               "ORDER BY id LIMIT 300", (time.time(),)).fetchall()
+        blocked = set()
+        for msg_id, chat_id, body in rows:
+            if chat_id in blocked:
+                continue
+            try:
+                self.bot.send(body, chat_id=chat_id)
+            except BotError as exc:
+                if exc.code == 403:
+                    with self.db:
+                        self.unsubscribe(chat_id)
+                    blocked.add(chat_id)
+                    continue
+                if exc.code == 429:
+                    with self.db:
+                        self.db.execute("UPDATE outbox SET next_try=? WHERE chat_id=?",
+                                        (time.time() + max(1, exc.retry_after), chat_id))
+                    return
+                if exc.code != 400:
+                    raise
+                LOG.warning("Telegram отклонил сообщение из очереди: %s", exc)
+            with self.db:
+                self.db.execute("DELETE FROM outbox WHERE id=?", (msg_id,))
+            time.sleep(0.05)
 
 
 def process(db, posts, bot, config, now):
@@ -164,6 +249,7 @@ def process(db, posts, bot, config, now):
         # A changed post cancels its old reminders, even if delivery then fails.
         if old:
             db.execute("DELETE FROM reminders WHERE post_id=?", (post["id"],))
+            db.execute("DELETE FROM outbox WHERE post_id=?", (post["id"],))
             db.commit()
         if TICKET.search(post["text"]):
             start = sale_time(post["text"], post["published"])
@@ -178,7 +264,7 @@ def process(db, posts, bot, config, now):
             body = post["text"][:2600]
             bot.send(f"{title}\n\n{details}\n\n{body}\n\n{post['url']}\n\n"
                      "Следим за 30.12.2026 — Ак Барс и 06.01.2027 — Металлург. "
-                     "Объявление может относиться ко всей серии или другим матчам.")
+                     "Объявление может относиться ко всей серии или другим матчам.", post_id=post["id"])
             if start and now < start <= datetime.fromisoformat(config["watch_until"]):
                 for minutes in config["remind_minutes"]:
                     due = start - timedelta(minutes=minutes)
@@ -186,7 +272,8 @@ def process(db, posts, bot, config, now):
                         db.execute("INSERT OR REPLACE INTO reminders VALUES (?,?,?,?,?,0)",
                                    (post["id"], minutes, due.timestamp(), start.timestamp(), post["url"]))
         elif old and old[1]:
-            bot.send("Изменён ранее проверенный пост. Его старые напоминания отменены.\n" + post["url"])
+            bot.send("Изменён ранее проверенный пост. Его старые напоминания отменены.\n" + post["url"],
+                     post_id=post["id"])
         db.execute("INSERT OR REPLACE INTO posts VALUES (?,?,?)",
                    (post["id"], digest, bool(TICKET.search(post["text"]))))
         db.commit()
@@ -208,7 +295,7 @@ def send_due(db, bot, now):
             remaining = max(1, int((start - now).total_seconds() / 60))
             message = f"До объявленного старта продаж примерно {remaining} мин."
         bot.send(f"{message}\n{start:%d.%m.%Y в %H:%M} МСК\n"
-                 f"Проверьте, что объявление относится к нужным матчам:\n{url}")
+                 f"Проверьте, что объявление относится к нужным матчам:\n{url}", post_id=pid, reminder=True)
         db.execute("UPDATE reminders SET done=1 WHERE post_id=? AND due<=?", (pid, now.timestamp()))
         db.commit()
         sent.add(pid)
@@ -246,6 +333,7 @@ def main():
     if args.cancel is not None:
         with database(ROOT / "state.sqlite3") as db:
             db.execute("UPDATE reminders SET done=1 WHERE post_id=?", (args.cancel,))
+            db.execute("DELETE FROM outbox WHERE post_id=? AND reminder=1", (args.cancel,))
         print("Напоминания поста отменены:", args.cancel)
         return
     session = requests.Session()
@@ -259,44 +347,51 @@ def main():
         print("chat_id:", ", ".join(map(str, sorted(ids))) if ids else
               "не найден; отправьте /start вашему боту и повторите")
         return
-    if not config.get("chat_id") and not args.dry_run:
-        raise RuntimeError("Заполните chat_id: сначала отправьте боту /start, затем запустите --chat-id")
     if args.test:
+        if not config.get("chat_id"):
+            raise RuntimeError("Для --test укажите свой chat_id или проверьте подписку командой /start")
         bot.send("Проверка: уведомления «Локомотива» работают. Время — московское.")
         print("Тест отправлен")
         return
     db = database(":memory:" if args.dry_run else ROOT / "state.sqlite3")
     if args.dry_run:
-        bot.send = print
+        bot.send = lambda message, **_: print(message)
+        alerts = bot
+    else:
+        alerts = Broadcast(db, bot)
     last_id = db.execute("SELECT COALESCE(MAX(id),0) FROM posts").fetchone()[0]
     failures = 0
     while datetime.now(MSK) < datetime.fromisoformat(config["watch_until"]):
+        if not args.dry_run:
+            try:
+                alerts.poll()
+            except RuntimeError as exc:
+                LOG.error("Не удалось прочитать команды подписки: %s", exc)
         try:
             now = datetime.now(MSK)
             # Check reminders even when the source channel is unreachable.
-            send_due(db, bot, now)
+            send_due(db, alerts, now)
             cutoff = now - timedelta(days=config["initial_history_days"])
             posts = fetch_posts(session, config["channel"], cutoff, last_id)
             posts = [p for p in posts if p["published"] >= cutoff or p["id"] > last_id > 0]
-            process(db, posts, bot, config, datetime.now(MSK))
+            process(db, posts, alerts, config, datetime.now(MSK))
             last_id = db.execute("SELECT COALESCE(MAX(id),0) FROM posts").fetchone()[0]
             LOG.info("Проверено постов: %s; последний ID: %s", len(posts), last_id)
-            if failures >= 5:
-                bot.send("Мониторинг «Локомотива» восстановлен после ошибки.")
             failures = 0
         except (requests.RequestException, RuntimeError, sqlite3.Error, ValueError) as exc:
             failures += 1
             # Type only for requests exceptions: URLs may include secrets.
             safe = type(exc).__name__ if isinstance(exc, requests.RequestException) else str(exc)
             LOG.error("Ошибка #%s: %s", failures, safe)
-            if failures == 5:
-                try:
-                    bot.send("Пять ошибок мониторинга подряд. Проверьте компьютер, интернет и журнал. "
-                             "Объявления могут приходить с задержкой; скрипт продолжает попытки.")
-                except RuntimeError:
-                    pass
             if args.once or args.dry_run:
                 raise SystemExit(1)
+        if not args.dry_run:
+            try:
+                alerts.flush()
+            except RuntimeError as exc:
+                LOG.error("Ошибка доставки; очередь будет обработана повторно: %s", exc)
+                if args.once:
+                    raise SystemExit(1)
         if args.once or args.dry_run:
             break
         time.sleep(config["poll_seconds"])
