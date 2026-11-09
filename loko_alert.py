@@ -4,6 +4,7 @@ import hashlib
 import json
 import logging
 import re
+import secrets
 import sqlite3
 import time
 from datetime import datetime, timedelta, timezone
@@ -15,6 +16,7 @@ from bs4 import BeautifulSoup
 ROOT = Path(__file__).resolve().parent
 MSK = timezone(timedelta(hours=3))
 LOG = logging.getLogger("loko")
+TEST_PREFIX = "Тест рассылки «Локомотива» #"
 MONTHS = dict(zip(
     "января февраля марта апреля мая июня июля августа сентября октября ноября декабря".split(),
     range(1, 13)))
@@ -209,8 +211,14 @@ class Broadcast:
 
     def send(self, text, *, post_id=None, reminder=False):
         # Caller commits the outbox together with the processed post or reminder.
-        self.db.execute("INSERT INTO outbox (chat_id, body, post_id, reminder) "
-                        "SELECT chat_id, ?, ?, ? FROM subscribers", (text, post_id, reminder))
+        return self.db.execute("INSERT INTO outbox (chat_id, body, post_id, reminder) "
+                               "SELECT chat_id, ?, ?, ? FROM subscribers", (text, post_id, reminder)).rowcount
+
+    def queue_test(self):
+        label = TEST_PREFIX + secrets.token_hex(4)
+        with self.db:
+            count = self.send(label + "\nЭто проверка уведомлений. Билетные продажи не объявлены этим сообщением.")
+        return label, count
 
     def flush(self):
         rows = self.db.execute("SELECT id, chat_id, body FROM outbox WHERE next_try<=? "
@@ -219,9 +227,12 @@ class Broadcast:
         for msg_id, chat_id, body in rows:
             if chat_id in blocked:
                 continue
+            test_label = body.split("\n", 1)[0] if body.startswith(TEST_PREFIX) else None
             try:
                 self.bot.send(body, chat_id=chat_id)
             except BotError as exc:
+                if test_label:
+                    LOG.warning("%s: Telegram вернул код %s", test_label, exc.code)
                 if exc.code == 403:
                     with self.db:
                         self.unsubscribe(chat_id)
@@ -235,6 +246,9 @@ class Broadcast:
                 if exc.code != 400:
                     raise
                 LOG.warning("Telegram отклонил сообщение из очереди: %s", exc)
+            else:
+                if test_label:
+                    LOG.info("%s: принято Telegram", test_label)
             with self.db:
                 self.db.execute("DELETE FROM outbox WHERE id=?", (msg_id,))
             time.sleep(0.05)
@@ -325,10 +339,13 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--chat-id", action="store_true", help="Показать chat_id из личных /start")
     parser.add_argument("--test", action="store_true", help="Отправить тестовое сообщение")
+    parser.add_argument("--test-broadcast", action="store_true", help="Поставить тест для всех подписчиков в очередь")
     parser.add_argument("--once", action="store_true", help="Один проход мониторинга")
     parser.add_argument("--dry-run", action="store_true", help="Читать канал без отправки и записи состояния")
     parser.add_argument("--cancel", type=int, metavar="POST_ID", help="Отменить напоминания поста по его номеру")
     args = parser.parse_args()
+    if args.test_broadcast and (args.dry_run or args.test or args.once or args.chat_id or args.cancel is not None):
+        parser.error("--test-broadcast нужно запускать отдельно")
     config = load_config(require_token=not args.dry_run)
     if args.cancel is not None:
         with database(ROOT / "state.sqlite3") as db:
@@ -339,6 +356,14 @@ def main():
     session = requests.Session()
     session.headers["User-Agent"] = "LokoTicketNotifier/1.0"
     bot = Bot(session, config["bot_token"], config.get("chat_id"))
+    if args.test_broadcast:
+        db = database(ROOT / "state.sqlite3")
+        try:
+            label, count = Broadcast(db, bot).queue_test()
+        finally:
+            db.close()
+        print(f"{label}: поставлено в очередь — {count}. Отправит работающая служба.")
+        return
     if args.chat_id:
         updates = bot.call("getUpdates", timeout=0, limit=100)
         ids = {u["message"]["chat"]["id"] for u in updates if

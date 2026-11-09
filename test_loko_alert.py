@@ -161,6 +161,16 @@ class SubscriptionTests(unittest.TestCase):
         Broadcast(self.db, self.api).flush()
         self.assertEqual([c.kwargs["chat_id"] for c in self.api.send.call_args_list], [10, 20, 20])
 
+    def test_test_broadcast_uses_shared_queue_and_logs_each_acceptance(self):
+        self.db.execute("INSERT INTO subscribers VALUES (20)")
+        label, count = self.broadcast.queue_test()
+        self.assertEqual(count, 2)
+        self.api.send.assert_not_called()
+        with self.assertLogs("loko", level="INFO") as logs:
+            Broadcast(self.db, self.api).flush()
+        self.assertCountEqual([c.kwargs["chat_id"] for c in self.api.send.call_args_list], [10, 20])
+        self.assertEqual(sum(label in line and "принято Telegram" in line for line in logs.output), 2)
+
 
 if __name__ == "__main__":
     unittest.main()
