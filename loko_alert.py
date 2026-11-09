@@ -335,6 +335,7 @@ def load_config(require_token=True):
     return config
 
 
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--chat-id", action="store_true", help="Показать chat_id из личных /start")
